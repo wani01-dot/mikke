@@ -14,7 +14,12 @@ import {
   X as Close,
   Youtube,
 } from "lucide-react";
-
+const YOUTUBE_CHANNELS = [
+  {
+    name: "板橋ハウス",
+    channelId: "UC-r9zW6M0N9C9Y0R8F6mZ9A"
+  }
+];
 const initialPosts = [
   {
     id: 1,

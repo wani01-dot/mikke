@@ -3,11 +3,110 @@ import { getSupabaseAdmin } from "../../../lib/supabaseAdmin";
 
 export const dynamic = "force-dynamic";
 
+function cleanHandle(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^@/, "");
+}
+
+async function getYoutubeChannel(handle) {
+  const apiKey = process.env.YOUTUBE_API_KEY;
+
+  if (!apiKey) {
+    throw new Error("YOUTUBE_API_KEY が設定されていません");
+  }
+
+  const clean = cleanHandle(handle);
+
+  const url = new URL(
+    "https://www.googleapis.com/youtube/v3/channels"
+  );
+
+  url.searchParams.set(
+    "part",
+    "snippet,contentDetails"
+  );
+
+  url.searchParams.set(
+    "forHandle",
+    clean
+  );
+
+  url.searchParams.set(
+    "key",
+    apiKey
+  );
+
+  const response = await fetch(url.toString(), {
+    cache: "no-store",
+  });
+
+  const text = await response.text();
+
+  let data;
+
+  try {
+    data = JSON.parse(text);
+  } catch {
+    console.error(
+      "YouTube returned non-JSON:",
+      text.slice(0, 300)
+    );
+
+    throw new Error(
+      "YouTubeから正しいデータを取得できませんでした"
+    );
+  }
+
+  if (!response.ok) {
+    console.error(
+      "YouTube channel API error:",
+      data
+    );
+
+    throw new Error(
+      data?.error?.message ||
+        "YouTubeチャンネル情報を取得できませんでした"
+    );
+  }
+
+  if (!data.items?.length) {
+    throw new Error(
+      `@${clean} が見つかりませんでした`
+    );
+  }
+
+  const channel = data.items[0];
+
+  return {
+    id: channel.id,
+
+    title:
+      channel.snippet?.title ||
+      `@${clean}`,
+
+    handle: clean,
+
+    thumbnail:
+      channel.snippet?.thumbnails?.high?.url ||
+      channel.snippet?.thumbnails?.medium?.url ||
+      channel.snippet?.thumbnails?.default?.url ||
+      null,
+  };
+}
+
+/* ========================================
+   GET
+======================================== */
+
 export async function GET() {
   try {
     const supabase = getSupabaseAdmin();
 
-    const { data, error } = await supabase
+    const {
+      data,
+      error,
+    } = await supabase
       .from("monitored_accounts")
       .select("*")
       .eq("enabled", true)
@@ -23,11 +122,15 @@ export async function GET() {
       accounts: data || [],
     });
   } catch (error) {
-    console.error("accounts GET:", error);
+    console.error(
+      "accounts GET:",
+      error
+    );
 
     return NextResponse.json(
       {
-        error: "登録アカウントを取得できませんでした",
+        error:
+          "登録アカウントを取得できませんでした",
       },
       {
         status: 500,
@@ -36,19 +139,27 @@ export async function GET() {
   }
 }
 
+/* ========================================
+   POST
+======================================== */
+
 export async function POST(request) {
   try {
     const body = await request.json();
 
-    const platform = body.platform;
-    const handle = String(body.handle || "")
-      .trim()
-      .replace(/^@/, "");
+    const platform = String(
+      body.platform || ""
+    ).trim();
+
+    const handle = cleanHandle(
+      body.handle
+    );
 
     if (!platform || !handle) {
       return NextResponse.json(
         {
-          error: "platform と handle が必要です",
+          error:
+            "platform と handle が必要です",
         },
         {
           status: 400,
@@ -57,11 +168,14 @@ export async function POST(request) {
     }
 
     if (
-      !["youtube", "x", "instagram"].includes(platform)
+      !["youtube", "x", "instagram"].includes(
+        platform
+      )
     ) {
       return NextResponse.json(
         {
-          error: "対応していないSNSです",
+          error:
+            "対応していないSNSです",
         },
         {
           status: 400,
@@ -73,75 +187,65 @@ export async function POST(request) {
       String(body.name || "").trim() ||
       `@${handle}`;
 
-    let externalId = body.external_id || null;
-    let thumbnailUrl = body.thumbnail_url || null;
+    let externalId =
+      body.external_id || null;
 
-    /*
-      YouTubeの場合は、
-      Mikke側で正式なチャンネル情報を取得。
-    */
+    let thumbnailUrl =
+      body.thumbnail_url || null;
+
+    /* ========================================
+       YouTube
+    ======================================== */
+
     if (platform === "youtube") {
-      const origin = new URL(request.url).origin;
+      const channel =
+        await getYoutubeChannel(handle);
 
-      const youtubeResponse = await fetch(
-        `${origin}/api/youtube?handle=${encodeURIComponent(
-          handle
-        )}`,
-        {
-          cache: "no-store",
-        }
-      );
+      name = channel.title;
 
-      const youtubeData =
-        await youtubeResponse.json();
-
-      if (!youtubeResponse.ok) {
-        return NextResponse.json(
-          {
-            error:
-              youtubeData?.error ||
-              "YouTubeチャンネルが見つかりませんでした",
-          },
-          {
-            status: 400,
-          }
-        );
-      }
-
-      name =
-        youtubeData?.channel?.title ||
-        name;
-
-      externalId =
-        youtubeData?.channel?.id ||
-        null;
+      externalId = channel.id;
 
       thumbnailUrl =
-        youtubeData?.channel?.thumbnail ||
-        null;
+        channel.thumbnail;
     }
 
-    const supabase = getSupabaseAdmin();
+    /* ========================================
+       Supabase
+    ======================================== */
 
-    const { data, error } = await supabase
+    const supabase =
+      getSupabaseAdmin();
+
+    const {
+      data,
+      error,
+    } = await supabase
       .from("monitored_accounts")
       .upsert(
         {
           platform,
           name,
           handle,
-          external_id: externalId,
-          thumbnail_url: thumbnailUrl,
+          external_id:
+            externalId,
+          thumbnail_url:
+            thumbnailUrl,
           enabled: true,
         },
         {
-          onConflict: "platform,handle",
+          onConflict:
+            "platform,handle",
         }
       )
       .select()
       .single();
 
     if (error) {
+      console.error(
+        "Supabase account upsert:",
+        error
+      );
+
       throw error;
     }
 
@@ -149,11 +253,16 @@ export async function POST(request) {
       account: data,
     });
   } catch (error) {
-    console.error("accounts POST:", error);
+    console.error(
+      "accounts POST:",
+      error
+    );
 
     return NextResponse.json(
       {
-        error: "アカウントを登録できませんでした",
+        error:
+          error?.message ||
+          "アカウントを登録できませんでした",
       },
       {
         status: 500,
@@ -162,10 +271,15 @@ export async function POST(request) {
   }
 }
 
+/* ========================================
+   DELETE
+======================================== */
+
 export async function DELETE(request) {
   try {
-    const { searchParams } =
-      new URL(request.url);
+    const {
+      searchParams,
+    } = new URL(request.url);
 
     const id =
       searchParams.get("id");
@@ -181,9 +295,12 @@ export async function DELETE(request) {
       );
     }
 
-    const supabase = getSupabaseAdmin();
+    const supabase =
+      getSupabaseAdmin();
 
-    const { error } = await supabase
+    const {
+      error,
+    } = await supabase
       .from("monitored_accounts")
       .delete()
       .eq("id", id);
@@ -196,11 +313,15 @@ export async function DELETE(request) {
       ok: true,
     });
   } catch (error) {
-    console.error("accounts DELETE:", error);
+    console.error(
+      "accounts DELETE:",
+      error
+    );
 
     return NextResponse.json(
       {
-        error: "アカウントを削除できませんでした",
+        error:
+          "アカウントを削除できませんでした",
       },
       {
         status: 500,

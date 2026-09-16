@@ -18,15 +18,9 @@ export async function GET() {
 
     if (!video) {
       throw new Error(
-        "テスト用動画を取得できませんでした"
+        "YouTube動画を取得できませんでした"
       );
     }
-
-    const before = {
-      channel: youtube.channel.title,
-      title: video.title,
-      body: video.description,
-    };
 
     const {
       data: account,
@@ -42,76 +36,134 @@ export async function GET() {
       throw accountError;
     }
 
+    const testExternalId =
+      `debug-${Date.now()}`;
+
+    const before = {
+      title: video.title,
+      body: video.description,
+    };
+
     /*
-     * 本物のpostsを触らず、
-     * monitored_accountsのnameだけで
-     * UTF-8の往復テストをする。
+     * postsへ実際に保存
      */
 
     const {
-      data: originalAccount,
-      error: originalError,
+      data: inserted,
+      error: insertError,
     } = await supabase
-      .from("monitored_accounts")
-      .select("name")
-      .eq("id", account.id)
-      .single();
+      .from("posts")
+      .insert({
+        account_id: account.id,
 
-    if (originalError) {
-      throw originalError;
-    }
+        platform: "youtube",
 
-    const testName =
-      `UTF8テスト｜${youtube.channel.title}｜${video.title}`;
+        external_post_id:
+          testExternalId,
 
-    const {
-      error: updateError,
-    } = await supabase
-      .from("monitored_accounts")
-      .update({
-        name: testName,
+        title:
+          video.title,
+
+        body:
+          video.description,
+
+        post_url:
+          video.url,
+
+        thumbnail_url:
+          video.thumbnail,
+
+        published_at:
+          video.publishedAt,
       })
-      .eq("id", account.id);
-
-    if (updateError) {
-      throw updateError;
-    }
-
-    const {
-      data: afterAccount,
-      error: afterError,
-    } = await supabase
-      .from("monitored_accounts")
-      .select("name")
-      .eq("id", account.id)
+      .select()
       .single();
 
-    if (afterError) {
-      throw afterError;
+    if (insertError) {
+      throw insertError;
     }
 
     /*
-     * テスト後に元の名前へ戻す
+     * DBから改めて読み直す
      */
 
-    await supabase
-      .from("monitored_accounts")
-      .update({
-        name: originalAccount.name,
-      })
-      .eq("id", account.id);
+    const {
+      data: readBack,
+      error: readError,
+    } = await supabase
+      .from("posts")
+      .select(
+        "id, title, body, post_url"
+      )
+      .eq(
+        "id",
+        inserted.id
+      )
+      .single();
+
+    if (readError) {
+      throw readError;
+    }
+
+    const titleMatch =
+      before.title ===
+      readBack.title;
+
+    const bodyMatch =
+      before.body ===
+      readBack.body;
+
+    /*
+     * 診断データを削除
+     */
+
+    const {
+      error: deleteError,
+    } = await supabase
+      .from("posts")
+      .delete()
+      .eq(
+        "id",
+        inserted.id
+      );
+
+    if (deleteError) {
+      console.error(
+        "debug cleanup:",
+        deleteError
+      );
+    }
 
     return NextResponse.json(
       {
         youtubeBeforeSave: before,
 
-        sentToSupabase: testName,
+        insertedToPosts: {
+          title:
+            inserted.title,
 
-        readBackFromSupabase:
-          afterAccount.name,
+          body:
+            inserted.body,
+        },
+
+        readBackFromPosts: {
+          title:
+            readBack.title,
+
+          body:
+            readBack.body,
+        },
+
+        titleMatch,
+
+        bodyMatch,
 
         exactMatch:
-          testName === afterAccount.name,
+          titleMatch &&
+          bodyMatch,
+
+        cleanup:
+          !deleteError,
       },
       {
         headers: {
@@ -121,17 +173,22 @@ export async function GET() {
       }
     );
   } catch (error) {
-    console.error("UTF8 debug:", error);
+    console.error(
+      "posts UTF8 debug:",
+      error
+    );
 
     return NextResponse.json(
       {
         ok: false,
+
         error:
           error?.message ||
           "診断に失敗しました",
       },
       {
         status: 500,
+
         headers: {
           "Content-Type":
             "application/json; charset=utf-8",

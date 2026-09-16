@@ -4,22 +4,170 @@ import { getSupabaseAdmin } from "../../../lib/supabaseAdmin";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-export async function GET(request) {
-  return runSync(request);
+function cleanHandle(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^@/, "");
 }
 
-export async function POST(request) {
-  return runSync(request);
+async function getYoutubeVideos(handle) {
+  const apiKey = process.env.YOUTUBE_API_KEY;
+
+  if (!apiKey) {
+    throw new Error("YOUTUBE_API_KEY が設定されていません");
+  }
+
+  const clean = cleanHandle(handle);
+
+  // チャンネル取得
+  const channelUrl = new URL(
+    "https://www.googleapis.com/youtube/v3/channels"
+  );
+
+  channelUrl.searchParams.set(
+    "part",
+    "snippet,contentDetails"
+  );
+  channelUrl.searchParams.set("forHandle", clean);
+  channelUrl.searchParams.set("key", apiKey);
+
+  const channelResponse = await fetch(
+    channelUrl.toString(),
+    {
+      cache: "no-store",
+    }
+  );
+
+  const channelData = await channelResponse.json();
+
+  if (!channelResponse.ok) {
+    throw new Error(
+      channelData?.error?.message ||
+        "YouTubeチャンネルを取得できませんでした"
+    );
+  }
+
+  if (!channelData.items?.length) {
+    throw new Error(`@${clean} が見つかりませんでした`);
+  }
+
+  const channel = channelData.items[0];
+
+  const uploadsPlaylistId =
+    channel.contentDetails?.relatedPlaylists?.uploads;
+
+  if (!uploadsPlaylistId) {
+    throw new Error(
+      "アップロード動画一覧を取得できませんでした"
+    );
+  }
+
+  // 最新動画取得
+  const playlistUrl = new URL(
+    "https://www.googleapis.com/youtube/v3/playlistItems"
+  );
+
+  playlistUrl.searchParams.set(
+    "part",
+    "snippet,contentDetails"
+  );
+  playlistUrl.searchParams.set(
+    "playlistId",
+    uploadsPlaylistId
+  );
+  playlistUrl.searchParams.set(
+    "maxResults",
+    "20"
+  );
+  playlistUrl.searchParams.set(
+    "key",
+    apiKey
+  );
+
+  const videosResponse = await fetch(
+    playlistUrl.toString(),
+    {
+      cache: "no-store",
+    }
+  );
+
+  const videosData = await videosResponse.json();
+
+  if (!videosResponse.ok) {
+    throw new Error(
+      videosData?.error?.message ||
+        "YouTube動画を取得できませんでした"
+    );
+  }
+
+  const videos = (videosData.items || [])
+    .map((item) => {
+      const videoId =
+        item.contentDetails?.videoId ||
+        item.snippet?.resourceId?.videoId;
+
+      if (!videoId) return null;
+
+      return {
+        videoId,
+
+        title:
+          item.snippet?.title || "",
+
+        text:
+          item.snippet?.description || "",
+
+        publishedAt:
+          item.contentDetails?.videoPublishedAt ||
+          item.snippet?.publishedAt ||
+          null,
+
+        thumbnail:
+          item.snippet?.thumbnails?.maxres?.url ||
+          item.snippet?.thumbnails?.standard?.url ||
+          item.snippet?.thumbnails?.high?.url ||
+          item.snippet?.thumbnails?.medium?.url ||
+          item.snippet?.thumbnails?.default?.url ||
+          null,
+
+        url:
+          `https://www.youtube.com/watch?v=${videoId}`,
+      };
+    })
+    .filter(Boolean);
+
+  return {
+    channel: {
+      id: channel.id,
+
+      title:
+        channel.snippet?.title ||
+        `@${clean}`,
+
+      thumbnail:
+        channel.snippet?.thumbnails?.high?.url ||
+        channel.snippet?.thumbnails?.medium?.url ||
+        channel.snippet?.thumbnails?.default?.url ||
+        null,
+    },
+
+    videos,
+  };
 }
 
-async function runSync(request) {
+export async function GET() {
+  return runSync();
+}
+
+export async function POST() {
+  return runSync();
+}
+
+async function runSync() {
   try {
     const supabase = getSupabaseAdmin();
 
-    // ========================================
-    // 1. 登録中のYouTubeチャンネルを取得
-    // ========================================
-
+    // 登録チャンネル
     const {
       data: accounts,
       error: accountsError,
@@ -36,18 +184,15 @@ async function runSync(request) {
     if (!accounts?.length) {
       return NextResponse.json({
         ok: true,
-        message: "登録中のYouTubeチャンネルはありません",
         accounts: 0,
         checkedVideos: 0,
         newVideos: 0,
         notifications: 0,
+        results: [],
       });
     }
 
-    // ========================================
-    // 2. キーワードを取得
-    // ========================================
-
+    // キーワード
     const {
       data: keywords,
       error: keywordsError,
@@ -63,68 +208,35 @@ async function runSync(request) {
     let newVideos = 0;
     let notificationCount = 0;
 
-    const accountResults = [];
-
-    const origin = new URL(request.url).origin;
-
-    // ========================================
-    // 3. チャンネルごとにYouTubeを確認
-    // ========================================
+    const results = [];
 
     for (const account of accounts) {
       try {
-        const youtubeResponse = await fetch(
-          `${origin}/api/youtube?handle=${encodeURIComponent(
-            account.handle
-          )}`,
-          {
-            cache: "no-store",
-          }
-        );
+        const youtube =
+          await getYoutubeVideos(account.handle);
 
-        const youtubeData = await youtubeResponse.json();
+        // 正式な名前・アイコンを更新
+        await supabase
+          .from("monitored_accounts")
+          .update({
+            name: youtube.channel.title,
+            external_id: youtube.channel.id,
+            thumbnail_url:
+              youtube.channel.thumbnail,
+          })
+          .eq("id", account.id);
 
-        if (!youtubeResponse.ok) {
-          accountResults.push({
-            account: account.name,
-            ok: false,
-            error:
-              youtubeData?.error ||
-              "YouTubeから取得できませんでした",
-          });
-
-          continue;
-        }
-
-        // 正式なチャンネル情報も更新
-        const channel = youtubeData.channel;
-
-        if (channel) {
-          await supabase
-            .from("monitored_accounts")
-            .update({
-              name: channel.title || account.name,
-              external_id: channel.id || account.external_id,
-              thumbnail_url:
-                channel.thumbnail || account.thumbnail_url,
-            })
-            .eq("id", account.id);
-        }
-
-        const videos = youtubeData.videos || [];
+        const videos = youtube.videos || [];
 
         checkedVideos += videos.length;
 
-        // ========================================
-        // 初回同期かどうかを判定
-        // ========================================
-
+        // このチャンネルに既存投稿があるか
         const {
-          count: existingPostCount,
+          count,
           error: countError,
         } = await supabase
           .from("posts")
-          .select("*", {
+          .select("id", {
             count: "exact",
             head: true,
           })
@@ -134,54 +246,55 @@ async function runSync(request) {
           throw countError;
         }
 
-        const firstSync = existingPostCount === 0;
+        const firstSync = count === 0;
 
         let accountNewVideos = 0;
         let accountNotifications = 0;
 
-        // ========================================
-        // 4. 動画を1件ずつDBへ
-        // ========================================
-
         for (const video of videos) {
-          if (!video.videoId) {
-            continue;
-          }
-
-          // すでに保存されているか確認
+          // 既存チェック
           const {
-            data: existingPost,
+            data: existing,
             error: existingError,
           } = await supabase
             .from("posts")
             .select("id")
             .eq("platform", "youtube")
-            .eq("external_post_id", video.videoId)
+            .eq(
+              "external_post_id",
+              video.videoId
+            )
             .maybeSingle();
 
           if (existingError) {
             throw existingError;
           }
 
-          if (existingPost) {
+          if (existing) {
             continue;
           }
 
-          // 新しく発見した動画
+          // DB保存
           const {
-            data: insertedPost,
+            data: inserted,
             error: insertError,
           } = await supabase
             .from("posts")
             .insert({
               account_id: account.id,
               platform: "youtube",
-              external_post_id: video.videoId,
-              title: video.title || "",
-              body: video.text || "",
-              post_url: video.url || null,
-              thumbnail_url: video.thumbnail || null,
-              published_at: video.publishedAt || null,
+              external_post_id:
+                video.videoId,
+              title:
+                video.title || "",
+              body:
+                video.text || "",
+              post_url:
+                video.url || null,
+              thumbnail_url:
+                video.thumbnail || null,
+              published_at:
+                video.publishedAt || null,
             })
             .select()
             .single();
@@ -190,14 +303,7 @@ async function runSync(request) {
             throw insertError;
           }
 
-          /*
-            初回同期では過去動画を20件まとめて取得するので
-            全部を「新着通知」にしない。
-
-            2回目以降に初めて発見した動画だけ
-            newVideosとして扱う。
-          */
-
+          // 初回同期は過去20件を新着扱いしない
           if (firstSync) {
             continue;
           }
@@ -205,54 +311,51 @@ async function runSync(request) {
           newVideos += 1;
           accountNewVideos += 1;
 
-          // ========================================
-          // 5. この動画に適用するキーワード
-          // ========================================
-
-          const applicableKeywords = (keywords || []).filter(
-            (keyword) =>
-              keyword.account_id === null ||
-              keyword.account_id === account.id
-          );
-
-          if (!applicableKeywords.length) {
-            continue;
-          }
+          const applicableKeywords =
+            (keywords || []).filter(
+              (keyword) =>
+                keyword.account_id === null ||
+                keyword.account_id === account.id
+            );
 
           const searchableText = [
             video.title || "",
             video.text || "",
-            account.name || "",
+            youtube.channel.title || "",
             account.handle || "",
           ]
             .join(" ")
             .toLowerCase();
 
-          // ========================================
-          // 6. キーワード一致 → 通知履歴
-          // ========================================
-
           for (const keyword of applicableKeywords) {
-            const word = String(keyword.word || "").trim();
+            const word =
+              String(keyword.word || "").trim();
 
-            if (!word) {
+            if (!word) continue;
+
+            if (
+              !searchableText.includes(
+                word.toLowerCase()
+              )
+            ) {
               continue;
             }
 
-            if (!searchableText.includes(word.toLowerCase())) {
-              continue;
-            }
-
-            // 同じ投稿・同じキーワードの
-            // 二重通知を防ぐ
+            // 二重通知チェック
             const {
               data: existingNotification,
               error: notificationCheckError,
             } = await supabase
               .from("notifications")
               .select("id")
-              .eq("post_id", insertedPost.id)
-              .eq("keyword_id", keyword.id)
+              .eq(
+                "post_id",
+                inserted.id
+              )
+              .eq(
+                "keyword_id",
+                keyword.id
+              )
               .maybeSingle();
 
             if (notificationCheckError) {
@@ -264,18 +367,25 @@ async function runSync(request) {
             }
 
             const {
-              error: notificationInsertError,
+              error: notificationError,
             } = await supabase
               .from("notifications")
               .insert({
-                post_id: insertedPost.id,
-                keyword_id: keyword.id,
-                message: `「${word}」を含む新着動画を見つけました`,
-                is_read: false,
+                post_id:
+                  inserted.id,
+
+                keyword_id:
+                  keyword.id,
+
+                message:
+                  `「${word}」を含む新着動画を見つけました`,
+
+                is_read:
+                  false,
               });
 
-            if (notificationInsertError) {
-              throw notificationInsertError;
+            if (notificationError) {
+              throw notificationError;
             }
 
             notificationCount += 1;
@@ -283,47 +393,64 @@ async function runSync(request) {
           }
         }
 
-        accountResults.push({
-          account: channel?.title || account.name,
+        results.push({
+          account:
+            youtube.channel.title,
+
           ok: true,
+
           firstSync,
-          checked: videos.length,
-          newVideos: accountNewVideos,
-          notifications: accountNotifications,
+
+          checked:
+            videos.length,
+
+          newVideos:
+            accountNewVideos,
+
+          notifications:
+            accountNotifications,
         });
-      } catch (accountError) {
+      } catch (error) {
         console.error(
-          `sync account error: ${account.handle}`,
-          accountError
+          `sync ${account.handle}:`,
+          error
         );
 
-        accountResults.push({
-          account: account.name,
+        results.push({
+          account:
+            account.name,
+
           ok: false,
-          error: "このチャンネルの同期に失敗しました",
+
+          error:
+            error?.message ||
+            "同期に失敗しました",
         });
       }
     }
 
-    // ========================================
-    // 完了
-    // ========================================
-
     return NextResponse.json({
       ok: true,
-      accounts: accounts.length,
+      accounts:
+        accounts.length,
       checkedVideos,
       newVideos,
-      notifications: notificationCount,
-      results: accountResults,
+      notifications:
+        notificationCount,
+      results,
     });
   } catch (error) {
-    console.error("sync error:", error);
+    console.error(
+      "sync error:",
+      error
+    );
 
     return NextResponse.json(
       {
         ok: false,
-        error: "Mikkeの同期に失敗しました",
+        error:
+          error?.message ||
+          "Mikkeの同期に失敗しました",
       },
       {
         status: 500,

@@ -991,3 +991,100 @@ time {
     gap: 10px;
   }
 }
+/* ========================================
+   iPhone / Safari 安定化
+======================================== */
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  width: 100%;
+  overflow-x: hidden;
+}
+
+.app {
+  width: 100%;
+  overflow-x: hidden;
+}
+
+/*
+  iPhone Safariは16px未満の入力欄を
+  フォーカスすると自動ズームすることがある。
+*/
+input,
+textarea,
+select {
+  font-size: 16px !important;
+}
+
+/* 検索 */
+.search-field input {
+  font-size: 16px;
+}
+
+/* チャンネル追加・キーワード */
+.text-input {
+  font-size: 16px;
+}
+
+/* メモ */
+.sheet textarea {
+  font-size: 16px;
+}
+
+/*
+  ボタンを押したときのSafari独自表示を抑える
+*/
+button,
+a,
+input,
+textarea {
+  -webkit-tap-highlight-color: transparent;
+}
+
+button {
+  touch-action: manipulation;
+}
+
+/*
+  横スクロール部分がページ全体を
+  引っ張らないようにする
+*/
+.people {
+  max-width: 100%;
+  overscroll-behavior-x: contain;
+}
+
+/*
+  長いYouTubeタイトルなどによる
+  横方向へのはみ出し防止
+*/
+.card,
+.post-text,
+.post-link,
+.identity,
+.mini,
+.manage-info {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.post-text {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/*
+  iPhone下部のホームインジケーター対応
+*/
+.bottom {
+  height: calc(82px + env(safe-area-inset-bottom));
+  padding-bottom: calc(15px + env(safe-area-inset-bottom));
+}
+
+.app {
+  padding-bottom: calc(105px + env(safe-area-inset-bottom));
+}

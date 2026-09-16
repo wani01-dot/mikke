@@ -89,28 +89,21 @@ function formatRelativeTime(dateString) {
   if (!dateString) return "";
 
   const date = new Date(dateString);
-
   if (Number.isNaN(date.getTime())) return "";
 
-  const diff = Date.now() - date.getTime();
+  const diff = Math.max(0, Date.now() - date.getTime());
   const minutes = Math.floor(diff / 60000);
 
   if (minutes < 1) return "たった今";
   if (minutes < 60) return `${minutes}分前`;
 
   const hours = Math.floor(minutes / 60);
-
   if (hours < 24) return `${hours}時間前`;
 
   const days = Math.floor(hours / 24);
-
   if (days < 30) return `${days}日前`;
 
-  return date.toLocaleDateString("ja-JP", {
-    year: "numeric",
-    month: "numeric",
-    day: "numeric",
-  });
+  return date.toLocaleDateString("ja-JP");
 }
 
 function cleanYoutubeHandle(value) {
@@ -138,20 +131,27 @@ function cleanYoutubeHandle(value) {
   return text.trim();
 }
 
-function convertYoutubeVideo(video) {
+function dbPostToUi(post) {
+  const account = post.monitored_accounts || {};
+
   return {
-    id: video.id,
-    platform: "youtube",
-    user: video.user || "YouTube",
-    handle: video.handle || "YouTube",
-    time: formatRelativeTime(video.publishedAt),
-    publishedAt: video.publishedAt,
-    text: video.title || "タイトルなし",
+    id: post.external_post_id
+      ? `youtube-${post.external_post_id}`
+      : post.id,
+    dbId: post.id,
+    platform: post.platform || "youtube",
+    user: account.name || "YouTube",
+    handle: account.handle
+      ? `@${account.handle.replace(/^@/, "")}`
+      : "YouTube",
+    time: formatRelativeTime(post.published_at),
+    publishedAt: post.published_at,
+    text: post.title || post.body || "タイトルなし",
     kind: "video",
     tags: ["動画"],
-    image: video.thumbnail || null,
-    url: video.url || null,
-    channelThumbnail: video.channelThumbnail || null,
+    image: post.thumbnail_url || null,
+    url: post.post_url || null,
+    channelThumbnail: account.thumbnail_url || null,
   };
 }
 
@@ -164,37 +164,139 @@ export default function Page() {
   const [memos, setMemos] = useState({});
   const [editing, setEditing] = useState(null);
 
-  const [youtubeChannels, setYoutubeChannels] = useState(
-    DEFAULT_YOUTUBE_CHANNELS
-  );
-  const [youtubePosts, setYoutubePosts] = useState([]);
-  const [youtubeLoading, setYoutubeLoading] = useState(true);
-  const [youtubeErrors, setYoutubeErrors] = useState([]);
+  const [accounts, setAccounts] = useState([]);
+  const [dbPosts, setDbPosts] = useState([]);
+  const [keywords, setKeywords] = useState([]);
+  const [notifications, setNotifications] = useState([]);
 
   const [selectedUser, setSelectedUser] = useState("all");
 
   const [addOpen, setAddOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(false);
-
   const [searchOpen, setSearchOpen] = useState(false);
-  const [searchText, setSearchText] = useState("");
-
-  const [keywords, setKeywords] = useState([]);
-  const [keywordOnly, setKeywordOnly] = useState(false);
   const [keywordOpen, setKeywordOpen] = useState(false);
+
+  const [searchText, setSearchText] = useState("");
+  const [keywordOnly, setKeywordOnly] = useState(false);
+
+  const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+  const [error, setError] = useState("");
 
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
     try {
-      const storedSaved = JSON.parse(
-        localStorage.getItem("mikke-saved") || "[]"
+      setSaved(
+        JSON.parse(localStorage.getItem("mikke-saved") || "[]")
       );
 
-      const storedMemos = JSON.parse(
-        localStorage.getItem("mikke-memos") || "{}"
+      setMemos(
+        JSON.parse(localStorage.getItem("mikke-memos") || "{}")
       );
+    } catch {}
 
+    setReady(true);
+  }, []);
+
+  async function loadAccounts() {
+    const response = await fetch("/api/accounts", {
+      cache: "no-store",
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(
+        data?.error || "登録チャンネルを取得できませんでした"
+      );
+    }
+
+    setAccounts(data.accounts || []);
+
+    return data.accounts || [];
+  }
+
+  async function loadPosts() {
+    const response = await fetch("/api/posts", {
+      cache: "no-store",
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data?.error || "投稿を取得できませんでした");
+    }
+
+    setDbPosts((data.posts || []).map(dbPostToUi));
+  }
+
+  async function loadKeywords() {
+    const response = await fetch("/api/keywords", {
+      cache: "no-store",
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(
+        data?.error || "キーワードを取得できませんでした"
+      );
+    }
+
+    setKeywords(data.keywords || []);
+  }
+
+  async function loadNotifications() {
+    const response = await fetch("/api/notifications", {
+      cache: "no-store",
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data?.error || "通知を取得できませんでした");
+    }
+
+    setNotifications(data.notifications || []);
+  }
+
+  async function runSync() {
+    setSyncing(true);
+
+    try {
+      const response = await fetch("/api/sync", {
+        method: "POST",
+        cache: "no-store",
+      });
+
+      const data = await response.json();
+
+      if (!response.ok || !data.ok) {
+        throw new Error(data?.error || "同期に失敗しました");
+      }
+
+      await Promise.all([
+        loadAccounts(),
+        loadPosts(),
+        loadNotifications(),
+      ]);
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  async function migrateOldData(currentAccounts) {
+    if (!ready) return;
+
+    if (localStorage.getItem("mikke-supabase-migrated") === "1") {
+      return;
+    }
+
+    let oldChannels = DEFAULT_YOUTUBE_CHANNELS;
+    let oldKeywords = [];
+
+    try {
       const storedChannels = JSON.parse(
         localStorage.getItem("mikke-youtube-channels") || "null"
       );
@@ -203,171 +305,149 @@ export default function Page() {
         localStorage.getItem("mikke-keywords") || "[]"
       );
 
-      setSaved(storedSaved);
-      setMemos(storedMemos);
-
-      if (Array.isArray(storedChannels)) {
-        setYoutubeChannels(storedChannels);
+      if (Array.isArray(storedChannels) && storedChannels.length) {
+        oldChannels = storedChannels;
       }
 
       if (Array.isArray(storedKeywords)) {
-        setKeywords(storedKeywords);
+        oldKeywords = storedKeywords;
       }
     } catch {}
 
-    setReady(true);
-  }, []);
-
-  useEffect(() => {
-    if (!ready) return;
-
-    localStorage.setItem(
-      "mikke-youtube-channels",
-      JSON.stringify(youtubeChannels)
+    const knownHandles = new Set(
+      currentAccounts
+        .filter((account) => account.platform === "youtube")
+        .map((account) =>
+          String(account.handle || "").replace(/^@/, "").toLowerCase()
+        )
     );
-  }, [youtubeChannels, ready]);
 
-  useEffect(() => {
-    if (!ready) return;
+    for (const channel of oldChannels) {
+      const handle = cleanYoutubeHandle(channel.handle || "");
 
-    localStorage.setItem(
-      "mikke-keywords",
-      JSON.stringify(keywords)
-    );
-  }, [keywords, ready]);
+      if (!handle || knownHandles.has(handle.toLowerCase())) {
+        continue;
+      }
+
+      const response = await fetch("/api/accounts", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          platform: "youtube",
+          handle,
+          name: channel.name || `@${handle}`,
+        }),
+      });
+
+      if (response.ok) {
+        knownHandles.add(handle.toLowerCase());
+      }
+    }
+
+    for (const word of oldKeywords) {
+      if (!String(word).trim()) continue;
+
+      await fetch("/api/keywords", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          word: String(word).trim(),
+          account_id: null,
+        }),
+      });
+    }
+
+    localStorage.setItem("mikke-supabase-migrated", "1");
+  }
 
   useEffect(() => {
     if (!ready) return;
 
     let cancelled = false;
 
-    async function loadYoutube() {
-      if (!youtubeChannels.length) {
-        setYoutubePosts([]);
-        setYoutubeErrors([]);
-        setYoutubeLoading(false);
-        return;
-      }
+    async function start() {
+      setLoading(true);
+      setError("");
 
-      setYoutubeLoading(true);
-      setYoutubeErrors([]);
+      try {
+        const currentAccounts = await loadAccounts();
 
-      const results = await Promise.allSettled(
-        youtubeChannels.map(async (channel) => {
-          const response = await fetch(
-            `/api/youtube?handle=${encodeURIComponent(channel.handle)}`,
-            { cache: "no-store" }
-          );
+        await migrateOldData(currentAccounts);
 
-          const data = await response.json();
+        if (cancelled) return;
 
-          if (!response.ok) {
-            throw new Error(
-              `${channel.name || "チャンネル"}：${
-                data?.error || "取得できませんでした"
-              }`
-            );
-          }
+        await loadAccounts();
+        await loadKeywords();
 
-          return {
-            channel,
-            data,
-          };
-        })
-      );
+        if (cancelled) return;
 
-      if (cancelled) return;
-
-      const videos = [];
-      const errors = [];
-      const correctedChannels = [];
-
-      results.forEach((result, index) => {
-        const original = youtubeChannels[index];
-
-        if (result.status === "fulfilled") {
-          const { data } = result.value;
-
-          const realName =
-            data?.channel?.title ||
-            original.name ||
-            `@${original.handle}`;
-
-          correctedChannels.push({
-            name: realName,
-            handle: original.handle,
-            thumbnail: data?.channel?.thumbnail || null,
-          });
-
-          (data.videos || []).forEach((video) => {
-            videos.push(convertYoutubeVideo(video));
-          });
-        } else {
-          correctedChannels.push(original);
-
-          errors.push(
-            result.reason?.message ||
-              `${original.name}を取得できませんでした`
-          );
+        await runSync();
+      } catch (e) {
+        if (!cancelled) {
+          setError(e?.message || "読み込みに失敗しました");
         }
-      });
-
-      videos.sort(
-        (a, b) =>
-          new Date(b.publishedAt || 0).getTime() -
-          new Date(a.publishedAt || 0).getTime()
-      );
-
-      setYoutubePosts(videos);
-      setYoutubeErrors(errors);
-
-      const changed =
-        JSON.stringify(correctedChannels) !==
-        JSON.stringify(youtubeChannels);
-
-      if (changed) {
-        setYoutubeChannels(correctedChannels);
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
       }
-
-      setYoutubeLoading(false);
     }
 
-    loadYoutube();
+    start();
 
     return () => {
       cancelled = true;
     };
-  }, [youtubeChannels, ready]);
+  }, [ready]);
 
   const allPosts = useMemo(() => {
-    return [...youtubePosts, ...initialPosts];
-  }, [youtubePosts]);
+    return [...dbPosts, ...initialPosts].sort((a, b) => {
+      const aTime = new Date(a.publishedAt || 0).getTime();
+      const bTime = new Date(b.publishedAt || 0).getTime();
+
+      if (!a.publishedAt && !b.publishedAt) return 0;
+      if (!a.publishedAt) return 1;
+      if (!b.publishedAt) return -1;
+
+      return bTime - aTime;
+    });
+  }, [dbPosts]);
+
+  const youtubeAccounts = useMemo(
+    () => accounts.filter((account) => account.platform === "youtube"),
+    [accounts]
+  );
 
   const people = useMemo(() => {
     const map = new Map();
 
     allPosts.forEach((post) => {
+      if (platform !== "all" && post.platform !== platform) {
+        return;
+      }
+
       if (!map.has(post.user)) {
         map.set(post.user, {
           name: post.user,
           thumbnail: post.channelThumbnail || null,
         });
-      } else if (
-        post.channelThumbnail &&
-        !map.get(post.user).thumbnail
-      ) {
-        map.set(post.user, {
-          name: post.user,
-          thumbnail: post.channelThumbnail,
-        });
       }
     });
 
     return Array.from(map.values());
-  }, [allPosts]);
+  }, [allPosts, platform]);
+
+  const keywordWords = useMemo(
+    () => keywords.map((item) => item.word),
+    [keywords]
+  );
 
   const matchesKeyword = (post) => {
-    if (!keywords.length) return true;
+    if (!keywordWords.length) return true;
 
     const source = [
       post.text,
@@ -378,8 +458,8 @@ export default function Page() {
       .join(" ")
       .toLowerCase();
 
-    return keywords.some((word) =>
-      source.includes(word.toLowerCase())
+    return keywordWords.some((word) =>
+      source.includes(String(word).toLowerCase())
     );
   };
 
@@ -426,31 +506,32 @@ export default function Page() {
     kind,
     selectedUser,
     keywordOnly,
-    keywords,
+    keywordWords,
     searchText,
   ]);
 
-  const savedPosts = useMemo(() => {
-    return allPosts.filter((post) => saved.includes(post.id));
-  }, [allPosts, saved]);
+  const savedPosts = useMemo(
+    () => allPosts.filter((post) => saved.includes(post.id)),
+    [allPosts, saved]
+  );
 
-  const editingPost = useMemo(() => {
-    if (!editing) return null;
+  const editingPost = useMemo(
+    () => allPosts.find((post) => post.id === editing),
+    [allPosts, editing]
+  );
 
-    return allPosts.find((post) => post.id === editing);
-  }, [allPosts, editing]);
+  const unreadCount = useMemo(
+    () => notifications.filter((item) => !item.is_read).length,
+    [notifications]
+  );
 
   const toggleSaved = (id) => {
     const next = saved.includes(id)
-      ? saved.filter((savedId) => savedId !== id)
+      ? saved.filter((item) => item !== id)
       : [...saved, id];
 
     setSaved(next);
-
-    localStorage.setItem(
-      "mikke-saved",
-      JSON.stringify(next)
-    );
+    localStorage.setItem("mikke-saved", JSON.stringify(next));
   };
 
   const saveMemo = (id, value) => {
@@ -460,16 +541,11 @@ export default function Page() {
     };
 
     setMemos(next);
-
-    localStorage.setItem(
-      "mikke-memos",
-      JSON.stringify(next)
-    );
-
+    localStorage.setItem("mikke-memos", JSON.stringify(next));
     setEditing(null);
   };
 
-  const addYoutubeChannel = (value) => {
+  async function addYoutubeChannel(value) {
     const handle = cleanYoutubeHandle(value);
 
     if (!handle) {
@@ -479,25 +555,41 @@ export default function Page() {
       };
     }
 
-    const exists = youtubeChannels.some(
-      (channel) =>
-        channel.handle.toLowerCase() === handle.toLowerCase()
-    );
-
-    if (exists) {
+    if (
+      youtubeAccounts.some(
+        (account) =>
+          String(account.handle).replace(/^@/, "").toLowerCase() ===
+          handle.toLowerCase()
+      )
+    ) {
       return {
         ok: false,
         message: "このチャンネルはすでに追加されています。",
       };
     }
 
-    setYoutubeChannels((current) => [
-      ...current,
-      {
-        name: `@${handle}`,
-        handle,
+    const response = await fetch("/api/accounts", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
       },
-    ]);
+      body: JSON.stringify({
+        platform: "youtube",
+        handle,
+      }),
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        message: data?.error || "追加できませんでした。",
+      };
+    }
+
+    await loadAccounts();
+    await runSync();
 
     setPlatform("youtube");
     setSelectedUser("all");
@@ -505,349 +597,408 @@ export default function Page() {
     return {
       ok: true,
     };
-  };
+  }
 
-  const removeYoutubeChannel = (handle) => {
-    const target = youtubeChannels.find(
-      (channel) => channel.handle === handle
+  async function removeYoutubeChannel(id) {
+    const response = await fetch(
+      `/api/accounts?id=${encodeURIComponent(id)}`,
+      {
+        method: "DELETE",
+      }
     );
 
-    setYoutubeChannels((current) =>
-      current.filter((channel) => channel.handle !== handle)
-    );
-
-    if (target && selectedUser === target.name) {
-      setSelectedUser("all");
+    if (!response.ok) {
+      setError("チャンネルを削除できませんでした");
+      return;
     }
-  };
 
-  const addKeyword = (value) => {
+    setSelectedUser("all");
+
+    await Promise.all([
+      loadAccounts(),
+      loadPosts(),
+      loadNotifications(),
+      loadKeywords(),
+    ]);
+  }
+
+  async function addKeyword(value, accountId = null) {
     const word = value.trim();
 
-    if (!word) return false;
+    if (!word) {
+      return {
+        ok: false,
+        message: "キーワードを入力してね。",
+      };
+    }
 
-    const exists = keywords.some(
-      (item) => item.toLowerCase() === word.toLowerCase()
+    const response = await fetch("/api/keywords", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        word,
+        account_id: accountId,
+      }),
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        message: data?.error || "追加できませんでした。",
+      };
+    }
+
+    await loadKeywords();
+
+    return {
+      ok: true,
+    };
+  }
+
+  async function removeKeyword(id) {
+    await fetch(`/api/keywords?id=${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+
+    await loadKeywords();
+  }
+
+  async function openNotification(notification) {
+    if (!notification.is_read) {
+      await fetch("/api/notifications", {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          id: notification.id,
+        }),
+      });
+
+      setNotifications((current) =>
+        current.map((item) =>
+          item.id === notification.id
+            ? {
+                ...item,
+                is_read: true,
+              }
+            : item
+        )
+      );
+    }
+
+    const url = notification.posts?.post_url;
+
+    if (url) {
+      window.open(url, "_blank", "noopener,noreferrer");
+    }
+  }
+
+  async function markAllRead() {
+    await fetch("/api/notifications", {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        all: true,
+      }),
+    });
+
+    setNotifications((current) =>
+      current.map((item) => ({
+        ...item,
+        is_read: true,
+      }))
     );
-
-    if (exists) return false;
-
-    setKeywords((current) => [...current, word]);
-
-    return true;
-  };
-
-  const removeKeyword = (word) => {
-    setKeywords((current) =>
-      current.filter((item) => item !== word)
-    );
-  };
-
-  const goHome = () => {
-    setPage("home");
-  };
+  }
 
   return (
-    <main className={"app " + (page === "saved" ? "saved-page" : "")}>
-      <header>
-        <div>
-          <h1>Mikke</h1>
-          <p>見逃したくない、あの瞬間を。</p>
-        </div>
-
-        <div className="header-icons">
-          <button
-            className="icon-button"
-            onClick={() => setSearchOpen(true)}
-            aria-label="検索"
-          >
-            <Search />
-          </button>
-
-          <button
-            className="icon-button"
-            onClick={() => setKeywordOpen(true)}
-            aria-label="キーワード"
-          >
-            <Bell />
-          </button>
-        </div>
-      </header>
-
-      {page === "home" ? (
-        <>
-          <nav className="platform-tabs">
-            {["all", "x", "instagram", "youtube"].map((item) => (
-              <button
-                key={item}
-                className={platform === item ? "active" : ""}
-                onClick={() => {
-                  setPlatform(item);
-                  setSelectedUser("all");
-                }}
-              >
-                {item === "all" ? "すべて" : platformLabel[item]}
-              </button>
-            ))}
-          </nav>
-
-          <section className="people">
-            <button
-              className={
-                "person person-button " +
-                (selectedUser === "all" ? "selected" : "")
-              }
-              onClick={() => setSelectedUser("all")}
-            >
-              <div className="avatar avatar-all">
-                <Check size={20} />
-              </div>
-              <span>全員</span>
-            </button>
-
-            {people.map((person) => (
-              <button
-                className={
-                  "person person-button " +
-                  (selectedUser === person.name ? "selected" : "")
-                }
-                key={person.name}
-                onClick={() => setSelectedUser(person.name)}
-              >
-                <div className="avatar">
-                  {person.thumbnail ? (
-                    <img
-                      src={person.thumbnail}
-                      alt={person.name}
-                    />
-                  ) : (
-                    person.name.slice(0, 1)
-                  )}
-                </div>
-
-                <span>{person.name}</span>
-              </button>
-            ))}
-
-            <button
-              className="person person-button"
-              onClick={() => setAddOpen(true)}
-            >
-              <div className="avatar add">＋</div>
-              <span>追加</span>
-            </button>
-
-            <button
-              className="person person-button"
-              onClick={() => setManageOpen(true)}
-            >
-              <div className="avatar add">
-                <Settings size={20} />
-              </div>
-              <span>管理</span>
-            </button>
-          </section>
-
-          {searchText && (
-            <div className="active-filter">
-              <Search size={14} />
-              <span>「{searchText}」で検索中</span>
-              <button onClick={() => setSearchText("")}>
-                <Close size={15} />
-              </button>
-            </div>
-          )}
-
-          {keywordOnly && (
-            <div className="active-filter keyword-filter">
-              <Bell size={14} />
-              <span>
-                キーワード一致のみ
-                {keywords.length
-                  ? `：${keywords.join(" / ")}`
-                  : ""}
-              </span>
-
-              <button onClick={() => setKeywordOnly(false)}>
-                <Close size={15} />
-              </button>
-            </div>
-          )}
-
-          <div className="section-row">
-            <strong>新着</strong>
-
-            <div className="kind-tabs">
-              <button
-                className={kind === "all" ? "active" : ""}
-                onClick={() => setKind("all")}
-              >
-                すべて
-              </button>
-
-              <button
-                className={kind === "text" ? "active" : ""}
-                onClick={() => setKind("text")}
-              >
-                テキスト
-              </button>
-
-              <button
-                className={kind === "image" ? "active" : ""}
-                onClick={() => setKind("image")}
-              >
-                <ImageIcon size={15} />
-                画像
-              </button>
-
-              <button
-                className={kind === "video" ? "active" : ""}
-                onClick={() => setKind("video")}
-              >
-                <Video size={15} />
-                動画
-              </button>
-            </div>
-          </div>
-
-          {youtubeLoading &&
-            (platform === "all" || platform === "youtube") && (
-              <div className="status">
-                <span className="loader" />
-                YouTubeの新着を取得中...
-              </div>
-            )}
-
-          {!!youtubeErrors.length &&
-            (platform === "all" || platform === "youtube") && (
-              <div className="error-box">
-                {youtubeErrors.map((error) => (
-                  <p key={error}>{error}</p>
-                ))}
-              </div>
-            )}
-
-          <section className="feed">
-            {visible.map((post) => (
-              <PostCard
-                key={post.id}
-                post={post}
-                saved={saved.includes(post.id)}
-                memo={memos[post.id]}
-                keywordMatch={
-                  keywords.length > 0 && matchesKeyword(post)
-                }
-                onStar={() => toggleSaved(post.id)}
-                onMemo={() => setEditing(post.id)}
-              />
-            ))}
-
-            {!youtubeLoading && !visible.length && (
-              <div className="empty">
-                <Search />
-                <h3>見つかりませんでした</h3>
-                <p>
-                  フィルターや検索条件を変えると
-                  <br />
-                  見つかるかもしれません。
-                </p>
-              </div>
-            )}
-          </section>
-        </>
+    <main
+      className={
+        "app " +
+        (page === "saved"
+          ? "saved-page"
+          : page === "notifications"
+          ? "notification-page"
+          : "")
+      }
+    >
+      {page === "notifications" ? (
+        <NotificationPage
+          notifications={notifications}
+          unreadCount={unreadCount}
+          onOpen={openNotification}
+          onReadAll={markAllRead}
+        />
       ) : (
         <>
-          <div className="saved-title">
+          <header>
             <div>
-              <h2>後で見る</h2>
-              <p>{savedPosts.length}件保存中</p>
+              <h1>Mikke</h1>
+              <p>見逃したくない、あの瞬間を。</p>
             </div>
 
-            <button
-              className="icon-button"
-              onClick={() => setSearchOpen(true)}
-            >
-              <Search />
-            </button>
-          </div>
-
-          <nav className="platform-tabs saved-tabs">
-            {["all", "x", "instagram", "youtube"].map((item) => (
+            <div className="header-icons">
               <button
-                key={item}
-                className={platform === item ? "active" : ""}
-                onClick={() => setPlatform(item)}
+                className="icon-button"
+                onClick={() => setSearchOpen(true)}
               >
-                {item === "all" ? "すべて" : platformLabel[item]}
+                <Search />
               </button>
-            ))}
-          </nav>
 
-          <section className="feed">
-            {savedPosts.filter(
-              (post) =>
-                (platform === "all" || post.platform === platform) &&
-                (!searchText ||
-                  [
-                    post.user,
-                    post.handle,
-                    post.text,
-                    ...(post.tags || []),
-                  ]
-                    .join(" ")
-                    .toLowerCase()
-                    .includes(searchText.toLowerCase()))
-            ).length ? (
-              savedPosts
-                .filter(
-                  (post) =>
-                    (platform === "all" ||
-                      post.platform === platform) &&
-                    (!searchText ||
-                      [
-                        post.user,
-                        post.handle,
-                        post.text,
-                        ...(post.tags || []),
-                      ]
-                        .join(" ")
-                        .toLowerCase()
-                        .includes(searchText.toLowerCase()))
-                )
-                .map((post) => (
+              <button
+                className="icon-button notification-button"
+                onClick={() => setPage("notifications")}
+              >
+                <Bell />
+
+                {unreadCount > 0 && (
+                  <span className="notification-badge">
+                    {unreadCount > 99 ? "99+" : unreadCount}
+                  </span>
+                )}
+              </button>
+            </div>
+          </header>
+
+          {page === "home" ? (
+            <>
+              <nav className="platform-tabs">
+                {["all", "x", "instagram", "youtube"].map((item) => (
+                  <button
+                    key={item}
+                    className={platform === item ? "active" : ""}
+                    onClick={() => {
+                      setPlatform(item);
+                      setSelectedUser("all");
+                    }}
+                  >
+                    {item === "all"
+                      ? "すべて"
+                      : platformLabel[item]}
+                  </button>
+                ))}
+              </nav>
+
+              <section className="people">
+                <button
+                  className={
+                    "person person-button " +
+                    (selectedUser === "all" ? "selected" : "")
+                  }
+                  onClick={() => setSelectedUser("all")}
+                >
+                  <div className="avatar avatar-all">
+                    <Check size={20} />
+                  </div>
+                  <span>全員</span>
+                </button>
+
+                {people.map((person) => (
+                  <button
+                    className={
+                      "person person-button " +
+                      (selectedUser === person.name ? "selected" : "")
+                    }
+                    key={person.name}
+                    onClick={() => setSelectedUser(person.name)}
+                  >
+                    <div className="avatar">
+                      {person.thumbnail ? (
+                        <img
+                          src={person.thumbnail}
+                          alt={person.name}
+                        />
+                      ) : (
+                        person.name.slice(0, 1)
+                      )}
+                    </div>
+
+                    <span>{person.name}</span>
+                  </button>
+                ))}
+
+                <button
+                  className="person person-button"
+                  onClick={() => setAddOpen(true)}
+                >
+                  <div className="avatar add">＋</div>
+                  <span>追加</span>
+                </button>
+
+                <button
+                  className="person person-button"
+                  onClick={() => setManageOpen(true)}
+                >
+                  <div className="avatar add">
+                    <Settings size={20} />
+                  </div>
+                  <span>管理</span>
+                </button>
+              </section>
+
+              {searchText && (
+                <div className="active-filter">
+                  <Search size={14} />
+                  <span>「{searchText}」で検索中</span>
+
+                  <button onClick={() => setSearchText("")}>
+                    <Close size={15} />
+                  </button>
+                </div>
+              )}
+
+              {keywordOnly && (
+                <div className="active-filter keyword-filter">
+                  <Bell size={14} />
+                  <span>キーワード一致のみ</span>
+
+                  <button onClick={() => setKeywordOnly(false)}>
+                    <Close size={15} />
+                  </button>
+                </div>
+              )}
+
+              <div className="section-row">
+                <strong>新着</strong>
+
+                <div className="kind-tabs">
+                  <button
+                    className={kind === "all" ? "active" : ""}
+                    onClick={() => setKind("all")}
+                  >
+                    すべて
+                  </button>
+
+                  <button
+                    className={kind === "text" ? "active" : ""}
+                    onClick={() => setKind("text")}
+                  >
+                    テキスト
+                  </button>
+
+                  <button
+                    className={kind === "image" ? "active" : ""}
+                    onClick={() => setKind("image")}
+                  >
+                    <ImageIcon size={15} />
+                    画像
+                  </button>
+
+                  <button
+                    className={kind === "video" ? "active" : ""}
+                    onClick={() => setKind("video")}
+                  >
+                    <Video size={15} />
+                    動画
+                  </button>
+                </div>
+              </div>
+
+              {(loading || syncing) && (
+                <div className="status">
+                  <span className="loader" />
+                  {syncing
+                    ? "YouTubeの新着を確認中..."
+                    : "Mikkeを読み込み中..."}
+                </div>
+              )}
+
+              {error && (
+                <div className="error-box">
+                  <p>{error}</p>
+                </div>
+              )}
+
+              <section className="feed">
+                {visible.map((post) => (
                   <PostCard
                     key={post.id}
                     post={post}
-                    saved
+                    saved={saved.includes(post.id)}
                     memo={memos[post.id]}
                     keywordMatch={
-                      keywords.length > 0 && matchesKeyword(post)
+                      keywordWords.length > 0 &&
+                      matchesKeyword(post)
                     }
                     onStar={() => toggleSaved(post.id)}
                     onMemo={() => setEditing(post.id)}
                   />
-                ))
-            ) : (
-              <div className="empty">
-                <Star />
-                <h3>まだ何もありません</h3>
-                <p>
-                  気になる投稿の☆を押すと、
-                  <br />
-                  ここに溜まります。
-                </p>
+                ))}
+
+                {!loading && !visible.length && (
+                  <div className="empty">
+                    <Search />
+                    <h3>見つかりませんでした</h3>
+                    <p>
+                      フィルターや検索条件を変えると
+                      <br />
+                      見つかるかもしれません。
+                    </p>
+                  </div>
+                )}
+              </section>
+            </>
+          ) : (
+            <>
+              <div className="saved-title">
+                <div>
+                  <h2>後で見る</h2>
+                  <p>{savedPosts.length}件保存中</p>
+                </div>
+
+                <button
+                  className="icon-button"
+                  onClick={() => setSearchOpen(true)}
+                >
+                  <Search />
+                </button>
               </div>
-            )}
-          </section>
+
+              <section className="feed">
+                {savedPosts.length ? (
+                  savedPosts.map((post) => (
+                    <PostCard
+                      key={post.id}
+                      post={post}
+                      saved
+                      memo={memos[post.id]}
+                      keywordMatch={
+                        keywordWords.length > 0 &&
+                        matchesKeyword(post)
+                      }
+                      onStar={() => toggleSaved(post.id)}
+                      onMemo={() => setEditing(post.id)}
+                    />
+                  ))
+                ) : (
+                  <div className="empty">
+                    <Star />
+                    <h3>まだ何もありません</h3>
+                    <p>
+                      気になる投稿の☆を押すと、
+                      <br />
+                      ここに溜まります。
+                    </p>
+                  </div>
+                )}
+              </section>
+            </>
+          )}
         </>
       )}
 
       <BottomNav
         page={page}
         setPage={setPage}
+        unreadCount={unreadCount}
         onAdd={() => setAddOpen(true)}
         onSearch={() => setSearchOpen(true)}
-        onKeywords={() => setKeywordOpen(true)}
       />
 
       {editing && editingPost && (
@@ -868,7 +1019,7 @@ export default function Page() {
 
       {manageOpen && (
         <ManageChannelsSheet
-          channels={youtubeChannels}
+          channels={youtubeAccounts}
           onClose={() => setManageOpen(false)}
           onDelete={removeYoutubeChannel}
           onAdd={() => {
@@ -885,7 +1036,7 @@ export default function Page() {
           onSearch={(value) => {
             setSearchText(value.trim());
             setSearchOpen(false);
-            goHome();
+            setPage("home");
           }}
         />
       )}
@@ -893,6 +1044,7 @@ export default function Page() {
       {keywordOpen && (
         <KeywordSheet
           keywords={keywords}
+          accounts={youtubeAccounts}
           keywordOnly={keywordOnly}
           onClose={() => setKeywordOpen(false)}
           onAdd={addKeyword}
@@ -946,17 +1098,19 @@ function PostCard({
           <button
             className="thumb thumb-button"
             onClick={openPost}
-            aria-label="投稿を開く"
           >
-            <img src={post.image} alt={post.text || "投稿サムネイル"} />
+            <img
+              src={post.image}
+              alt={post.text || "投稿サムネイル"}
+            />
 
-            {post.kind === "video" && <div className="play">▶</div>}
+            {post.kind === "video" && (
+              <div className="play">▶</div>
+            )}
           </button>
         ) : (
           <div className="thumb">
             <img src={post.image} alt="投稿サムネイル" />
-
-            {post.kind === "video" && <div className="play">▶</div>}
           </div>
         ))}
 
@@ -966,20 +1120,24 @@ function PostCard({
             <span key={tag}>{tag}</span>
           ))}
 
-          {keywordMatch && <span className="keyword-hit">HIT</span>}
+          {keywordMatch && (
+            <span className="keyword-hit">HIT</span>
+          )}
         </div>
 
         <div className="actions">
-          <button onClick={onMemo} aria-label="メモ">
+          <button onClick={onMemo}>
             <MessageSquare size={19} />
           </button>
 
           <button
             className={saved ? "starred" : ""}
             onClick={onStar}
-            aria-label="後で見る"
           >
-            <Star size={21} fill={saved ? "currentColor" : "none"} />
+            <Star
+              size={21}
+              fill={saved ? "currentColor" : "none"}
+            />
           </button>
         </div>
       </div>
@@ -995,12 +1153,99 @@ function PostCard({
   );
 }
 
+function NotificationPage({
+  notifications,
+  unreadCount,
+  onOpen,
+  onReadAll,
+}) {
+  return (
+    <>
+      <div className="notification-title">
+        <div>
+          <h2>通知</h2>
+          <p>
+            {unreadCount
+              ? `未読 ${unreadCount}件`
+              : "すべて確認済み"}
+          </p>
+        </div>
+
+        {unreadCount > 0 && (
+          <button onClick={onReadAll}>
+            すべて既読
+          </button>
+        )}
+      </div>
+
+      <section className="notification-list">
+        {notifications.map((item) => {
+          const post = item.posts;
+          const account = post?.monitored_accounts;
+
+          return (
+            <button
+              key={item.id}
+              className={
+                "notification-card " +
+                (!item.is_read ? "unread" : "")
+              }
+              onClick={() => onOpen(item)}
+            >
+              <div className="notification-icon">
+                <Bell size={18} />
+              </div>
+
+              <div className="notification-content">
+                <div className="notification-meta">
+                  <b>{account?.name || "Mikke"}</b>
+                  <span>
+                    {formatRelativeTime(item.created_at)}
+                  </span>
+                </div>
+
+                <p className="notification-message">
+                  {item.message}
+                </p>
+
+                {post?.title && (
+                  <p className="notification-post-title">
+                    {post.title}
+                  </p>
+                )}
+
+                {item.keywords?.word && (
+                  <span className="notification-keyword">
+                    {item.keywords.word}
+                  </span>
+                )}
+              </div>
+            </button>
+          );
+        })}
+
+        {!notifications.length && (
+          <div className="empty">
+            <Bell />
+            <h3>まだ通知はありません</h3>
+            <p>
+              登録したキーワードを含む
+              <br />
+              新着動画をMikkeが見つけると表示されます。
+            </p>
+          </div>
+        )}
+      </section>
+    </>
+  );
+}
+
 function BottomNav({
   page,
   setPage,
+  unreadCount,
   onAdd,
   onSearch,
-  onKeywords,
 }) {
   return (
     <nav className="bottom">
@@ -1017,13 +1262,28 @@ function BottomNav({
         <span>検索</span>
       </button>
 
-      <button className="plus" onClick={onAdd} aria-label="追加">
+      <button className="plus" onClick={onAdd}>
         ＋
       </button>
 
-      <button onClick={onKeywords}>
-        <Bell />
-        <span>キーワード</span>
+      <button
+        className={
+          "bottom-notification " +
+          (page === "notifications" ? "on" : "")
+        }
+        onClick={() => setPage("notifications")}
+      >
+        <span className="nav-icon-wrap">
+          <Bell />
+
+          {unreadCount > 0 && (
+            <i className="nav-badge">
+              {unreadCount > 9 ? "9+" : unreadCount}
+            </i>
+          )}
+        </span>
+
+        <span>通知</span>
       </button>
 
       <button
@@ -1061,22 +1321,32 @@ function SheetShell({ title, subtitle, onClose, children }) {
 function AddChannelSheet({ onClose, onAdd }) {
   const [value, setValue] = useState("");
   const [message, setMessage] = useState("");
+  const [submitting, setSubmitting] = useState(false);
 
-  const submit = () => {
-    const result = onAdd(value);
+  const submit = async () => {
+    if (submitting) return;
 
-    if (!result.ok) {
-      setMessage(result.message);
-      return;
+    setSubmitting(true);
+    setMessage("");
+
+    try {
+      const result = await onAdd(value);
+
+      if (!result.ok) {
+        setMessage(result.message);
+        return;
+      }
+
+      onClose();
+    } finally {
+      setSubmitting(false);
     }
-
-    onClose();
   };
 
   return (
     <SheetShell
       title="チャンネルを追加"
-      subtitle="いまはYouTubeに対応しています"
+      subtitle="YouTubeチャンネルを監視します"
       onClose={onClose}
     >
       <div className="service-card youtube-service">
@@ -1090,7 +1360,9 @@ function AddChannelSheet({ onClose, onAdd }) {
         </div>
       </div>
 
-      <label className="field-label">チャンネルURL / @ハンドル</label>
+      <label className="field-label">
+        チャンネルURL / @ハンドル
+      </label>
 
       <input
         className="text-input"
@@ -1104,14 +1376,16 @@ function AddChannelSheet({ onClose, onAdd }) {
         autoCorrect="off"
       />
 
-      <p className="input-help">
-        例：@itabasihausu またはYouTubeのチャンネルURL
-      </p>
+      {message && (
+        <p className="form-error">{message}</p>
+      )}
 
-      {message && <p className="form-error">{message}</p>}
-
-      <button className="save" onClick={submit}>
-        追加する
+      <button
+        className="save"
+        onClick={submit}
+        disabled={submitting}
+      >
+        {submitting ? "追加中..." : "追加する"}
       </button>
     </SheetShell>
   );
@@ -1131,10 +1405,13 @@ function ManageChannelsSheet({
     >
       <div className="manage-list">
         {channels.map((channel) => (
-          <div className="manage-row" key={channel.handle}>
+          <div className="manage-row" key={channel.id}>
             <div className="manage-avatar">
-              {channel.thumbnail ? (
-                <img src={channel.thumbnail} alt={channel.name} />
+              {channel.thumbnail_url ? (
+                <img
+                  src={channel.thumbnail_url}
+                  alt={channel.name}
+                />
               ) : (
                 <Youtube size={20} />
               )}
@@ -1142,24 +1419,19 @@ function ManageChannelsSheet({
 
             <div className="manage-info">
               <b>{channel.name}</b>
-              <span>@{channel.handle}</span>
+              <span>
+                @{String(channel.handle).replace(/^@/, "")}
+              </span>
             </div>
 
             <button
               className="delete-button"
-              onClick={() => onDelete(channel.handle)}
-              aria-label="削除"
+              onClick={() => onDelete(channel.id)}
             >
               <Trash2 size={18} />
             </button>
           </div>
         ))}
-
-        {!channels.length && (
-          <div className="sheet-empty">
-            YouTubeチャンネルはまだ登録されていません。
-          </div>
-        )}
       </div>
 
       <button className="secondary-button" onClick={onAdd}>
@@ -1199,21 +1471,13 @@ function SearchSheet({ value, onClose, onSearch }) {
       <button className="save" onClick={() => onSearch(text)}>
         検索する
       </button>
-
-      {value && (
-        <button
-          className="clear-button"
-          onClick={() => onSearch("")}
-        >
-          検索を解除
-        </button>
-      )}
     </SheetShell>
   );
 }
 
 function KeywordSheet({
   keywords,
+  accounts,
   keywordOnly,
   onClose,
   onAdd,
@@ -1221,15 +1485,19 @@ function KeywordSheet({
   onToggle,
 }) {
   const [value, setValue] = useState("");
+  const [accountId, setAccountId] = useState("");
   const [message, setMessage] = useState("");
 
-  const submit = () => {
+  const submit = async () => {
     if (!value.trim()) return;
 
-    const added = onAdd(value);
+    const result = await onAdd(
+      value,
+      accountId || null
+    );
 
-    if (!added) {
-      setMessage("同じキーワードがすでにあります。");
+    if (!result.ok) {
+      setMessage(result.message);
       return;
     }
 
@@ -1240,9 +1508,27 @@ function KeywordSheet({
   return (
     <SheetShell
       title="キーワード"
-      subtitle="気になる言葉を登録しておけます"
+      subtitle="全体またはチャンネルごとに設定できます"
       onClose={onClose}
     >
+      <label className="field-label">
+        対象
+      </label>
+
+      <select
+        className="text-input"
+        value={accountId}
+        onChange={(e) => setAccountId(e.target.value)}
+      >
+        <option value="">すべてのチャンネル</option>
+
+        {accounts.map((account) => (
+          <option key={account.id} value={account.id}>
+            {account.name}
+          </option>
+        ))}
+      </select>
+
       <div className="keyword-add">
         <input
           className="text-input"
@@ -1259,14 +1545,24 @@ function KeywordSheet({
         </button>
       </div>
 
-      {message && <p className="form-error">{message}</p>}
+      {message && (
+        <p className="form-error">{message}</p>
+      )}
 
       <div className="keyword-list">
-        {keywords.map((word) => (
-          <div className="keyword-chip" key={word}>
-            <span>{word}</span>
+        {keywords.map((keyword) => (
+          <div className="keyword-chip" key={keyword.id}>
+            <span>
+              {keyword.word}
 
-            <button onClick={() => onDelete(word)}>
+              {keyword.monitored_accounts?.name && (
+                <small>
+                  {keyword.monitored_accounts.name}
+                </small>
+              )}
+            </span>
+
+            <button onClick={() => onDelete(keyword.id)}>
               <Close size={14} />
             </button>
           </div>
@@ -1280,15 +1576,16 @@ function KeywordSheet({
       </div>
 
       <button
-        className={"keyword-toggle " + (keywordOnly ? "on" : "")}
+        className={
+          "keyword-toggle " +
+          (keywordOnly ? "on" : "")
+        }
         onClick={onToggle}
         disabled={!keywords.length}
       >
         <div>
           <b>一致した投稿だけ表示</b>
-          <span>
-            登録した言葉を含む投稿に絞り込みます
-          </span>
+          <span>登録した言葉を含む投稿に絞ります</span>
         </div>
 
         <div className="switch">
@@ -1320,7 +1617,9 @@ function MemoSheet({
         </div>
       </div>
 
-      <label className="field-label">この投稿について</label>
+      <label className="field-label">
+        この投稿について
+      </label>
 
       <textarea
         value={text}
@@ -1329,9 +1628,14 @@ function MemoSheet({
         placeholder="忘れたくないこと、あとで確認したいこと…"
       />
 
-      <small className="counter">{text.length}/500</small>
+      <small className="counter">
+        {text.length}/500
+      </small>
 
-      <button className="save" onClick={() => onSave(text)}>
+      <button
+        className="save"
+        onClick={() => onSave(text)}
+      >
         保存
       </button>
     </SheetShell>
